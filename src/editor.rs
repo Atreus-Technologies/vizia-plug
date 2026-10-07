@@ -3,8 +3,14 @@
 use crossbeam::atomic::AtomicCell;
 use nice_plug_core::context::gui::GuiContext;
 use nice_plug_core::debug::*;
-use nice_plug_core::editor::{Editor, Modifiers, ParentWindowHandle, VirtualKeyCode};
+use nice_plug_core::editor::dpi::{LogicalSize, NativeSize, Size};
+use nice_plug_core::editor::{
+    Editor, EditorHandle, HostMethods, Modifiers, ParentWindowHandle, ResizeHint, SpawnedEditor,
+    VirtualKeyCode,
+};
 use std::collections::VecDeque;
+use std::convert::Infallible;
+use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use vizia::prelude::*;
@@ -13,6 +19,42 @@ use vizia::views::TextEvent;
 use crate::widgets::RawParamEvent;
 use crate::widgets::param_registry::ParamRegistry;
 use crate::{ViziaState, ViziaTheming, widgets};
+
+/// Bridges nice-plug's `ParentWindowHandle` (raw-window-handle 0.6) to the
+/// raw-window-handle 0.5 `HasRawWindowHandle` that vizia's forked baseview
+/// expects, by extracting the platform handle per variant.
+struct RwhParent(ParentWindowHandle);
+
+unsafe impl raw_window_handle::HasRawWindowHandle for RwhParent {
+    fn raw_window_handle(&self) -> raw_window_handle::RawWindowHandle {
+        use raw_window_handle::{
+            AppKitWindowHandle, RawWindowHandle, Win32WindowHandle, XcbWindowHandle,
+            XlibWindowHandle,
+        };
+        match self.0 {
+            ParentWindowHandle::AppKitNsView(ns_view) => {
+                let mut h = AppKitWindowHandle::empty();
+                h.ns_view = ns_view.as_ptr();
+                RawWindowHandle::AppKit(h)
+            }
+            ParentWindowHandle::Win32Hwnd(hwnd) => {
+                let mut h = Win32WindowHandle::empty();
+                h.hwnd = hwnd.get() as *mut std::ffi::c_void;
+                RawWindowHandle::Win32(h)
+            }
+            ParentWindowHandle::XlibWindow(window) => {
+                let mut h = XlibWindowHandle::empty();
+                h.window = window;
+                RawWindowHandle::Xlib(h)
+            }
+            ParentWindowHandle::XcbWindow(window) => {
+                let mut h = XcbWindowHandle::empty();
+                h.window = window.get();
+                RawWindowHandle::Xcb(h)
+            }
+        }
+    }
+}
 
 /// A key-down event queued by the host-thread
 /// `Editor::on_virtual_key_from_host` callback, waiting for the next
@@ -64,10 +106,10 @@ impl KeyInjectState {
 }
 
 /// An [`Editor`] implementation that calls a vizia draw loop.
-pub(crate) struct ViziaEditor {
+pub struct ViziaEditor {
     pub(crate) vizia_state: Arc<ViziaState>,
     /// The user's app function.
-    pub(crate) app: Arc<dyn Fn(&mut Context, Arc<dyn GuiContext>) + 'static + Send + Sync>,
+    pub(crate) app: Arc<dyn Fn(&mut Context, GuiContext) + 'static + Send + Sync>,
     /// What level of theming to apply. See [`ViziaEditorTheming`].
     pub(crate) theming: ViziaTheming,
 
@@ -95,11 +137,16 @@ pub(crate) struct ViziaEditor {
 }
 
 impl Editor for ViziaEditor {
+    type Handle = ViziaEditorHandle;
+
     fn spawn(
         &self,
-        parent: ParentWindowHandle,
-        context: Arc<dyn GuiContext>,
-    ) -> Box<dyn std::any::Any + Send> {
+        parent: Option<ParentWindowHandle>,
+        _wait_for_parent: bool,
+        fallback_scale_factor: Option<f64>,
+        gui_context: GuiContext,
+        _host: Option<HostMethods>,
+    ) -> Result<SpawnedEditor<Self::Handle>, Box<dyn Error>> {
         let app = self.app.clone();
         let vizia_state = self.vizia_state.clone();
         let theming = self.theming;
@@ -110,10 +157,28 @@ impl Editor for ViziaEditor {
         param_registry.clear_signals();
 
         let (unscaled_width, unscaled_height) = vizia_state.inner_logical_size();
+        if let Some(sf) = fallback_scale_factor {
+            self.scaling_factor.store(Some(sf as f32));
+        }
         let system_scaling_factor = self.scaling_factor.load();
         let user_scale_factor = vizia_state.user_scale_factor();
 
-        let mut application = Application::new(move |cx| {
+        // Resizing is zoom-only (aspect-locked user scale): vizia_baseview can
+        // rescale its window but not resize it freely. Requests from the host
+        // (`set_size`) or a dragged standalone window land here and are
+        // applied on the UI thread in `on_idle`.
+        let pending_scale = Arc::new(AtomicCell::new(None::<f64>));
+        let standalone = parent.is_none();
+        // Native sizes are logical on macOS, physical elsewhere.
+        let native_scale = if cfg!(target_os = "macos") {
+            1.0
+        } else {
+            system_scaling_factor.unwrap_or(1.0) as f64
+        };
+
+        // `GuiContext` is a cheap (Arc-backed) struct in 0.4.2; clone per consumer.
+        let context = gui_context;
+        let mut application = Application::new(Box::new(move |cx: &mut Context| {
             // Set some default styles to match the iced integration
             //if theming >= ViziaTheming::Custom {
             // NOTE: `Context::set_default_font` was removed upstream as a deprecated API
@@ -156,7 +221,7 @@ impl Editor for ViziaEditor {
             .build(cx);
 
             app(cx, context.clone())
-        })
+        }) as AppBuilder)
         .with_scale_policy(
             system_scaling_factor
                 .map(|factor| WindowScalePolicy::ScaleFactor(factor as f64))
@@ -167,7 +232,25 @@ impl Editor for ViziaEditor {
         .on_idle({
             let emit_parameters_changed_event = self.emit_parameters_changed_event.clone();
             let key_inject = self.key_inject.clone();
+            let pending_scale = pending_scale.clone();
+            let vizia_state = self.vizia_state.clone();
             move |cx| {
+                #[cfg(target_os = "macos")]
+                if standalone {
+                    let base = vizia_state.inner_logical_size();
+                    if let Some(w) = standalone_content_width(base)
+                        && (w - vizia_state.scaled_logical_size().0 as f64).abs() > 1.0
+                    {
+                        pending_scale.store(Some(w / base.0 as f64));
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                let _ = standalone;
+                if let Some(scale) = pending_scale.take() {
+                    vizia_state.set_user_scale_factor(scale);
+                    cx.emit_custom(Event::new(WindowEvent::SetUserScale(scale)));
+                }
+
                 if emit_parameters_changed_event
                     .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
@@ -226,33 +309,132 @@ impl Editor for ViziaEditor {
             application = application.ignore_default_theme();
         }
 
-        let window = application.open_parented(&parent);
+        // Hosts give a parent; the standalone target doesn't, so hand the
+        // unopened app back for `run_until_closed` to run blocking.
+        let (window, app) = match parent {
+            Some(p) => (Some(application.open_parented(&RwhParent(p))), None),
+            None => (None, Some(application)),
+        };
 
         self.vizia_state.open.store(true, Ordering::Release);
-        Box::new(ViziaEditorHandle {
-            vizia_state: self.vizia_state.clone(),
-            window,
-            param_registry,
+        Ok(SpawnedEditor {
+            handle: ViziaEditorHandle {
+                vizia_state: self.vizia_state.clone(),
+                window,
+                pending_scale,
+                native_scale,
+                param_registry,
+                emit_parameters_changed_event: self.emit_parameters_changed_event.clone(),
+                key_inject: self.key_inject.clone(),
+            },
+            window: app,
         })
     }
 
-    fn size(&self) -> (u32, u32) {
-        // This includes the user scale factor if set, but not any HiDPI scaling
-        self.vizia_state.scaled_logical_size()
+    fn size(&self) -> NativeSize<u32> {
+        let (w, h) = self.vizia_state.scaled_logical_size();
+        let scale = self.scaling_factor.load().unwrap_or(1.0) as f64;
+        NativeSize::from_size(
+            nice_plug_core::editor::dpi::Size::Logical(
+                nice_plug_core::editor::dpi::LogicalSize::new(w as f64, h as f64),
+            ),
+            scale,
+        )
     }
 
-    fn set_scale_factor(&self, factor: f32) -> bool {
-        // If the editor is currently open then the host must not change the current HiDPI scale as
-        // we don't have a way to handle that. Ableton Live does this.
-        if self.vizia_state.is_open() {
-            return false;
-        }
+    fn resize_hint(&self) -> ResizeHint {
+        zoom_hint(&self.vizia_state)
+    }
+}
 
-        // We're making things a bit more complicated by having both a system scale factor, which is
-        // used for HiDPI and also known to the host, and a user scale factor that the user can use
-        // to arbitrarily resize the GUI
-        self.scaling_factor.store(Some(factor));
-        true
+/// Aspect-locked resizing down to half the base size (see `pending_scale`).
+fn zoom_hint(state: &ViziaState) -> ResizeHint {
+    let (w, h) = state.inner_logical_size();
+    ResizeHint {
+        // `with_aspect_ratio` sets the ratio but not this flag.
+        preserve_aspect_ratio: true,
+        ..ResizeHint::resizable()
+            .with_aspect_ratio(w, h)
+            .with_min_logical_size(LogicalSize::new(w as f32 / 2.0, h as f32 / 2.0))
+    }
+}
+
+/// Standalone only: baseview creates a fixed-size `NSWindow`, so make it
+/// resizable (aspect-locked) and return its current content width.
+#[cfg(target_os = "macos")]
+fn standalone_content_width((w, h): (u32, u32)) -> Option<f64> {
+    use objc2_app_kit::{NSApp, NSWindowStyleMask};
+    use objc2_foundation::{MainThreadMarker, NSSize};
+    let win = NSApp(MainThreadMarker::new()?).windows().firstObject()?;
+    let mask = win.styleMask();
+    if !mask.contains(NSWindowStyleMask::Resizable) {
+        win.setStyleMask(mask | NSWindowStyleMask::Resizable);
+        win.setContentAspectRatio(NSSize::new(w as f64, h as f64));
+        win.setContentMinSize(NSSize::new(w as f64 / 2.0, h as f64 / 2.0));
+    }
+    Some(win.contentView()?.frame().size.width)
+}
+
+/// Boxed so the unopened standalone `Application` has a nameable type.
+type AppBuilder = Box<dyn Fn(&mut Context) + Send>;
+
+impl EditorHandle for ViziaEditorHandle {
+    type Window = Option<Application<AppBuilder>>;
+    type Error = Infallible;
+
+    fn run_until_closed(window: Self::Window) -> Result<(), Self::Error> {
+        // `ApplicationError` is uninhabited.
+        window.map_or(Ok(()), |app| app.run().map_err(|e| match e {}))
+    }
+
+    fn set_parent(
+        &self,
+        _parent: ParentWindowHandle,
+        _window: &Self::Window,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn show(&self, _window: &Self::Window) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn hide(&self, _window: &Self::Window) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn host_main_thread_callback(&self, _window: &Self::Window) {}
+
+    fn set_size(
+        &self,
+        new_size: NativeSize<u32>,
+        _window: &Self::Window,
+    ) -> Result<(), Self::Error> {
+        let base_width = self.vizia_state.inner_logical_size().0 as f64;
+        self.pending_scale
+            .store(Some(new_size.width as f64 / self.native_scale / base_width));
+        Ok(())
+    }
+
+    fn set_fallback_scale_factor(
+        &self,
+        _scale_factor: f64,
+        _window: &Self::Window,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn adjust_size(
+        &self,
+        new_size: NativeSize<u32>,
+        _window: &Self::Window,
+    ) -> Option<NativeSize<u32>> {
+        let (w, h) = self.vizia_state.scaled_logical_size();
+        let current = NativeSize::from_size(
+            Size::Logical(LogicalSize::new(w as f64, h as f64)),
+            self.native_scale,
+        );
+        Some(zoom_hint(&self.vizia_state).adjust_size(new_size, current, self.native_scale))
     }
 
     fn param_value_changed(&self, _id: &str, _normalized_value: f32) {
@@ -265,12 +447,6 @@ impl Editor for ViziaEditor {
     }
 
     fn param_modulation_changed(&self, _id: &str, _modulation_offset: f32) {
-        self.param_registry.flush_all();
-        self.emit_parameters_changed_event
-            .store(true, Ordering::Relaxed);
-    }
-
-    fn param_values_changed(&self) {
         self.param_registry.flush_all();
         self.emit_parameters_changed_event
             .store(true, Ordering::Relaxed);
@@ -397,10 +573,14 @@ impl Editor for ViziaEditor {
 }
 
 /// The window handle used for [`ViziaEditor`].
-struct ViziaEditorHandle {
+pub struct ViziaEditorHandle {
     vizia_state: Arc<ViziaState>,
-    window: WindowHandle,
+    window: Option<WindowHandle>,
+    pending_scale: Arc<AtomicCell<Option<f64>>>,
+    native_scale: f64,
     param_registry: ParamRegistry,
+    emit_parameters_changed_event: Arc<AtomicBool>,
+    key_inject: Arc<KeyInjectState>,
 }
 
 /// The window handle enum stored within 'WindowHandle' contains raw pointers. Is there a way around
@@ -411,7 +591,44 @@ impl Drop for ViziaEditorHandle {
     fn drop(&mut self) {
         self.vizia_state.open.store(false, Ordering::Release);
         // XXX: This should automatically happen when the handle gets dropped, but apparently not
-        self.window.close();
+        if let Some(w) = self.window.as_mut() {
+            w.close();
+        }
         self.param_registry.clear_signals();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_is_zoom_resizable() {
+        let editor = crate::create_vizia_editor(
+            ViziaState::new(|| (900, 500)),
+            ViziaTheming::None,
+            |_, _| {},
+        )
+        .unwrap();
+        let hint = editor.resize_hint();
+        assert!(hint.can_resize && hint.preserve_aspect_ratio);
+        assert_eq!(
+            (hint.aspect_ratio_width, hint.aspect_ratio_height),
+            (900, 500)
+        );
+    }
+
+    #[test]
+    fn adjust_size_keeps_aspect_and_minimum() {
+        let hint = zoom_hint(&ViziaState::new(|| (900, 500)));
+        let cur = NativeSize::new(900, 500);
+        assert_eq!(
+            hint.adjust_size(NativeSize::new(1800, 700), cur, 1.0),
+            NativeSize::new(1260, 700)
+        );
+        assert_eq!(
+            hint.adjust_size(NativeSize::new(100, 100), cur, 1.0),
+            NativeSize::new(450, 250)
+        );
     }
 }

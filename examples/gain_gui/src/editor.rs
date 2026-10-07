@@ -1,10 +1,10 @@
-use nice_plug::prelude::{util, Editor};
+use nice_plug::prelude::util;
 use nice_plug::util::AtomicF32;
 use std::sync::Arc;
 use std::time::Duration;
 use vizia_plug::vizia::prelude::*;
 use vizia_plug::widgets::*;
-use vizia_plug::{create_vizia_editor, ViziaState, ViziaTheming};
+use vizia_plug::{create_vizia_editor, ViziaEditor, ViziaState, ViziaTheming};
 
 use crate::GainParams;
 
@@ -19,7 +19,7 @@ pub(crate) fn create(
     params: Arc<GainParams>,
     peak_meter: Arc<AtomicF32>,
     editor_state: Arc<ViziaState>,
-) -> Option<Box<dyn Editor>> {
+) -> Option<ViziaEditor> {
     create_vizia_editor(editor_state, ViziaTheming::Custom, move |cx, _| {
         // Read directly from the shared peak-meter atomic inside the widget's draw path.
         // This avoids editor-local timer callbacks that can be sensitive to host behavior.

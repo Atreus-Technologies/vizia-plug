@@ -78,7 +78,7 @@ pub enum GuiContextEvent {
     /// By changing the plugin's state that is used to determine the window's size before emitting
     /// this event, the window can be resized in a declarative and predictable way:
     ///
-    /// ```
+    /// ```ignore
     /// # use std::sync::Arc;
     /// # use std::sync::atomic::{AtomicBool, Ordering};
     /// # use vizia_plug::ViziaState;
@@ -112,13 +112,13 @@ pub enum GuiContextEvent {
 /// Handles parameter updates for VIZIA GUIs. Registered in
 /// [`ViziaEditor::spawn()`][super::ViziaEditor::spawn()].
 pub(crate) struct ParamModel {
-    pub context: Arc<dyn GuiContext>,
+    pub context: GuiContext,
 }
 
 /// Handles interactions through `WindowEvent` for VIZIA GUIs by updating the `ViziaState`.
 /// Registered in [`ViziaEditor::spawn()`][super::ViziaEditor::spawn()].
 pub(crate) struct WindowModel {
-    pub context: Arc<dyn GuiContext>,
+    pub context: GuiContext,
     pub vizia_state: Arc<ViziaState>,
 
     /// The last known unscaled logical window size. Used to prevent sending duplicate resize
@@ -145,12 +145,12 @@ impl Model for ParamModel {
 }
 
 impl Model for WindowModel {
-    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
+    fn event(&mut self, _cx: &mut EventContext, event: &mut Event) {
         event.map(|gui_context_event, meta| match gui_context_event {
             GuiContextEvent::Resize => {
                 // This will trigger a `WindowEvent::GeometryChanged`, which in turn causes the
                 // handler below this to be fired
-                let (width, height) = self.vizia_state.inner_logical_size();
+                let (_width, _height) = self.vizia_state.inner_logical_size();
                 //cx.set_window_size(WindowSize { width, height });
 
                 meta.consume();

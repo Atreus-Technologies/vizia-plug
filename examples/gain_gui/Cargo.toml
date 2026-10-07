@@ -11,5 +11,5 @@ description = "A simple gain plugin with an vizia GUI"
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-nice-plug = { version = "0.1.8", features = ["standalone"] }
+nice-plug = { version = "0.4.2", features = ["standalone"] }
 vizia_plug = { path = "../../" }

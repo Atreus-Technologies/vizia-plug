@@ -5,7 +5,6 @@
 
 use crossbeam::atomic::AtomicCell;
 use nice_plug_core::context::gui::GuiContext;
-use nice_plug_core::editor::Editor;
 use nice_plug_core::params::persist::PersistentField;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -18,6 +17,8 @@ pub use vizia;
 
 mod editor;
 pub mod widgets;
+
+pub use editor::{ViziaEditor, ViziaEditorHandle};
 
 use widgets::param_registry::ParamRegistry;
 
@@ -46,11 +47,11 @@ pub fn create_vizia_editor<F>(
     vizia_state: Arc<ViziaState>,
     theming: ViziaTheming,
     app: F,
-) -> Option<Box<dyn Editor>>
+) -> Option<editor::ViziaEditor>
 where
-    F: Fn(&mut Context, Arc<dyn GuiContext>) + 'static + Send + Sync,
+    F: Fn(&mut Context, GuiContext) + 'static + Send + Sync,
 {
-    Some(Box::new(editor::ViziaEditor {
+    Some(editor::ViziaEditor {
         vizia_state,
         app: Arc::new(app),
         theming,
@@ -66,7 +67,7 @@ where
         emit_parameters_changed_event: Arc::new(AtomicBool::new(false)),
         param_registry: ParamRegistry::new(),
         key_inject: editor::KeyInjectState::new(),
-    }))
+    })
 }
 
 /// Controls what level of theming to apply to the editor.
